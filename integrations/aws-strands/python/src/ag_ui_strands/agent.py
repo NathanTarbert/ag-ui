@@ -131,7 +131,11 @@ from .config import (
     maybe_await,
     normalize_predict_state,
 )
-from .utils import convert_agui_content_to_strands, flatten_content_to_text
+from .utils import (
+    convert_agui_content_to_strands,
+    flatten_content_to_text,
+    json_safe,
+)
 
 
 def _coerce_text(content: Any) -> str:
@@ -1282,13 +1286,19 @@ class StrandsAgent:
                             result_tool_id = tool_result.get("toolUseId")
                             result_content = tool_result.get("content", [])
 
+                            # A tool result block is text, json, image, document
+                            # or video. Read the first one of any type: dropping
+                            # the non-text kinds loses the payload silently
+                            # (issue #2233). ``result_found`` distinguishes "no
+                            # block at all" (a genuinely void tool -> empty
+                            # content) from "a block whose value is None".
                             result_data = None
+                            result_found = False
                             if result_content and isinstance(result_content, list):
                                 for content_item in result_content:
-                                    if (
-                                        isinstance(content_item, dict)
-                                        and "text" in content_item
-                                    ):
+                                    if not isinstance(content_item, dict):
+                                        continue
+                                    if "text" in content_item:
                                         text_content = content_item["text"]
                                         try:
                                             result_data = json.loads(text_content)
@@ -1300,8 +1310,22 @@ class StrandsAgent:
                                                 result_data = json.loads(json_text)
                                             except Exception:
                                                 result_data = text_content
+                                        result_found = True
+                                        break
+                                    if "json" in content_item:
+                                        result_data = content_item["json"]
+                                        result_found = True
+                                        break
+                                    if content_item.keys() & {
+                                        "image",
+                                        "document",
+                                        "video",
+                                    }:
+                                        result_data = json_safe(content_item)
+                                        result_found = True
+                                        break
 
-                            if not result_tool_id or result_data is None:
+                            if not result_tool_id:
                                 continue
 
                             # Direct lookup works for backend tools (keyed by Strands ID).
@@ -1336,7 +1360,11 @@ class StrandsAgent:
                             # A fresh message ID is used so CopilotKit creates a proper standalone
                             # ToolMessage and closes the spinner correctly.
                             tool_result_message_id = str(uuid.uuid4())
-                            tool_result_content = json.dumps(result_data)
+                            # A void result stays empty (not the string "null")
+                            # so the UI renders a result card without content.
+                            tool_result_content = (
+                                json.dumps(result_data) if result_found else ""
+                            )
                             yield ToolCallResultEvent(
                                 type=EventType.TOOL_CALL_RESULT,
                                 tool_call_id=result_tool_id,

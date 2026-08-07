@@ -1628,7 +1628,11 @@ export class StrandsAgent {
             // malformed tools. A void tool call (returns undefined/null) is
             // legitimate — emit an empty TOOL_CALL_RESULT so the UI still
             // renders a result card.
+            // `resultFound` distinguishes "no readable block at all" (a
+            // genuinely void tool -> empty content) from "a block whose value
+            // is null".
             let resultData: unknown = null;
+            let resultFound = false;
             const contentBlocks = hookEvent.result?.content;
             if (Array.isArray(contentBlocks)) {
               for (const cb of contentBlocks) {
@@ -1646,11 +1650,24 @@ export class StrandsAgent {
                       resultData = cb.text;
                     }
                   }
+                  resultFound = true;
                   break;
                 }
                 const maybeJson = (cb as unknown as { json?: unknown }).json;
                 if (maybeJson !== undefined) {
                   resultData = maybeJson;
+                  resultFound = true;
+                  break;
+                }
+                // Image/document/video blocks. Dropping them silently loses
+                // the payload (issue #2233). Their `toJSON()` yields the
+                // wrapped `{ image: { format, source } }` shape with bytes
+                // base64-encoded — the same payload the Python adapter emits.
+                const toJSON = (cb as unknown as { toJSON?: () => unknown })
+                  ?.toJSON;
+                if (typeof toJSON === "function") {
+                  resultData = toJSON.call(cb);
+                  resultFound = true;
                   break;
                 }
               }
@@ -1673,8 +1690,9 @@ export class StrandsAgent {
             // history. A fresh message id ensures CopilotKit creates a
             // standalone ToolMessage and closes the spinner correctly.
             const toolResultMessageId = uuid();
-            const toolResultContent =
-              resultData == null ? "" : JSON.stringify(resultData);
+            const toolResultContent = resultFound
+              ? JSON.stringify(resultData)
+              : "";
             yield {
               type: EventType.TOOL_CALL_RESULT,
               toolCallId: resultToolId,

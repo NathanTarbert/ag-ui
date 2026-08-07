@@ -179,6 +179,25 @@ def convert_agui_content_to_strands(content: List[Any]) -> List[Dict[str, Any]]:
     return blocks
 
 
+def json_safe(value: Any) -> Any:
+    """Recursively make a Strands content block JSON-serializable.
+
+    Media blocks (``image``/``document``/``video``) carry raw ``bytes`` in
+    ``source``; :func:`json.dumps` cannot encode those. Base64-encode them,
+    which is both what the AG-UI input side uses (see
+    :func:`convert_agui_content_to_strands`) and exactly what the Strands
+    TypeScript SDK's ``toJSON()`` emits — so both adapters put the same
+    payload on the wire.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    return value
+
+
 def flatten_content_to_text(content: Any) -> str:
     """Extract plain text from AG-UI message content.
 
