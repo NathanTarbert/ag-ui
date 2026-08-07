@@ -201,6 +201,13 @@ export class LangGraphAgent extends AbstractAgent {
   // message. See handleReasoningEvent.
   private pendingReasoningId?: string;
   activeRun?: RunMetadata;
+  // Message ids this run has streamed to the client (text messages and the
+  // assistant messages carrying tool calls). Used to detect a checkpoint that
+  // is behind the stream. See getStateAndMessagesSnapshots.
+  private streamedMessageIds: Set<string> = new Set();
+  // Every message id the client already knows about this run: the run input
+  // plus everything streamed since.
+  private knownMessageIds: Set<string> = new Set();
   // Subgraph node names discovered dynamically from langgraph_checkpoint_ns
   private subgraphs: Set<string> = new Set();
   private currentSubgraph: string = ROOT_SUBGRAPH_NAME;
@@ -317,8 +324,33 @@ export class LangGraphAgent extends AbstractAgent {
   }
 
   dispatchEvent(event: ProcessedEvents) {
+    this.trackDispatchedMessageId(event);
     this.subscriber.next(event);
     return true;
+  }
+
+  /**
+   * Records the message ids this run has put on the wire, so
+   * getStateAndMessagesSnapshots can tell whether a checkpoint is behind the
+   * stream.
+   */
+  private trackDispatchedMessageId(event: ProcessedEvents) {
+    let messageId: string | undefined;
+    switch (event.type) {
+      case EventType.TEXT_MESSAGE_START:
+        messageId = (event as { messageId?: string }).messageId;
+        break;
+      case EventType.TOOL_CALL_START:
+        messageId = (event as { parentMessageId?: string }).parentMessageId;
+        break;
+      case EventType.TOOL_CALL_RESULT:
+        messageId = (event as { messageId?: string }).messageId;
+        break;
+    }
+    if (messageId) {
+      this.streamedMessageIds.add(messageId);
+      this.knownMessageIds.add(messageId);
+    }
   }
 
   private dispatchInterruptFinish(args: {
@@ -402,6 +434,10 @@ export class LangGraphAgent extends AbstractAgent {
       modelMadeToolCall: false,
     };
     this.pendingReasoningId = undefined;
+    this.streamedMessageIds = new Set();
+    this.knownMessageIds = new Set(
+      (input.messages ?? []).map((m) => m.id).filter(Boolean),
+    );
     // Reset per-run flags
     this.cancelRequested = false;
     this.cancelSent = false;
@@ -1190,9 +1226,35 @@ export class LangGraphAgent extends AbstractAgent {
     });
     const checkpointMessages: LangGraphMessage[] =
       (state.values as State).messages ?? [];
+    const aguiMessages = langchainMessagesToAgui(checkpointMessages);
+
+    // The checkpoint lags the stream, so this snapshot can be strictly behind
+    // it: carrying nothing the client has not already seen while omitting a
+    // message that is still streaming. A client applying snapshot replace
+    // semantics would delete that in-flight message, and because one message
+    // id is pinned for the whole node no replacement TEXT_MESSAGE_START ever
+    // follows — the message is lost for the rest of the run
+    // (CopilotKit/CopilotKit#6301). Such a snapshot can only destroy
+    // information, so skip it. Snapshots that add anything — the subgraph
+    // commit this method exists to deliver — still go out.
+    const snapshotIds = new Set(aguiMessages.map((m) => m.id));
+    const addsNothing = aguiMessages.every((m) =>
+      this.knownMessageIds.has(m.id),
+    );
+    const behindStream = [...this.streamedMessageIds].some(
+      (id) => !snapshotIds.has(id),
+    );
+    if (addsNothing && behindStream) {
+      return;
+    }
+
+    for (const id of snapshotIds) {
+      this.knownMessageIds.add(id);
+    }
+
     this.dispatchEvent({
       type: EventType.MESSAGES_SNAPSHOT,
-      messages: langchainMessagesToAgui(checkpointMessages),
+      messages: aguiMessages,
     });
   }
 

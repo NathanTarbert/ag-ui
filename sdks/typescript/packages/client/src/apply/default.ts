@@ -103,6 +103,16 @@ export const defaultApplyEvents = (
   let state = structuredClone_(input.state);
   let currentMutation: AgentStateMutation = {};
 
+  // Ids whose stream is still open — started on this run and not yet ended.
+  // A MESSAGES_SNAPSHOT derived from a persistence checkpoint can lag the
+  // stream (LangGraph reads `threads.getState()` mid-run), and applying its
+  // delete semantics to a message that is still being streamed loses that
+  // message permanently: the producer keeps one pinned message id for the
+  // whole node, so no new TEXT_MESSAGE_START ever arrives and every later
+  // delta warns and no-ops. See CopilotKit/CopilotKit#6301.
+  const openTextMessageIds = new Set<string>();
+  const openToolCallIds = new Set<string>();
+
   const applyMutation = (mutation: AgentStateMutation) => {
     if (mutation.messages !== undefined) {
       messages = mutation.messages;
@@ -170,6 +180,8 @@ export const defaultApplyEvents = (
           if (mutation.stopPropagation !== true) {
             const { messageId, role = "assistant", name } = event as TextMessageStartEvent;
 
+            openTextMessageIds.add(messageId);
+
             // Check if a message with this ID already exists (e.g., created by TOOL_CALL_START
             // with the same parentMessageId)
             const existingMessage = messages.find((m) => m.id === messageId);
@@ -235,6 +247,8 @@ export const defaultApplyEvents = (
         case EventType.TEXT_MESSAGE_END: {
           const { messageId } = event as TextMessageEndEvent;
 
+          openTextMessageIds.delete(messageId);
+
           // Find the target message by ID
           const targetMessage = messages.find((m) => m.id === messageId);
           if (!targetMessage) {
@@ -292,6 +306,8 @@ export const defaultApplyEvents = (
 
           if (mutation.stopPropagation !== true) {
             const { toolCallId, toolCallName, parentMessageId } = event as ToolCallStartEvent;
+
+            openToolCallIds.add(toolCallId);
 
             // Applying a start event must be idempotent. The same start can
             // reach this reducer twice — a tool call already carried in
@@ -410,6 +426,8 @@ export const defaultApplyEvents = (
 
         case EventType.TOOL_CALL_END: {
           const { toolCallId } = event as ToolCallEndEvent;
+
+          openToolCallIds.delete(toolCallId);
 
           // Find the message containing this tool call
           const targetMessage = messages.find((m) =>
@@ -657,12 +675,50 @@ export const defaultApplyEvents = (
               (m.role === "activity" && !snapshotHasActivity) ||
               (m.role === "reasoning" && !snapshotHasReasoning);
 
-            // Step 1 + 2: Keep preserved client-only messages as-is, keep
-            // messages present in the snapshot (replaced with snapshot version),
-            // drop everything else.
+            // A snapshot can be *behind* the stream it interleaves with. The
+            // LangGraph adapter builds one from the persisted checkpoint, which
+            // lags, and dispatches it on every subgraph transition and at run
+            // end. Deleting a message that is still mid-stream loses it for
+            // good: the producer holds one pinned message id per node and only
+            // emits TEXT_MESSAGE_START when it has no message in progress, so
+            // no replacement start ever arrives and every subsequent
+            // TEXT_MESSAGE_CONTENT / TOOL_CALL_ARGS warns and no-ops against
+            // the now-missing id. So a message with an open text stream or an
+            // open tool call is never dropped, however far behind the snapshot
+            // is. Everything else keeps the authoritative replace semantics —
+            // a snapshot that genuinely removes settled history still does so.
+            const inFlightMessageIds = new Set(openTextMessageIds);
+            for (const m of messages) {
+              const toolCalls = (m as AssistantMessage).toolCalls;
+              if (toolCalls?.some((tc) => openToolCallIds.has(tc.id))) {
+                inFlightMessageIds.add(m.id);
+              }
+            }
+
+            // Tool results belonging to a preserved assistant message are
+            // preserved with it. Keeping the tool call while dropping its
+            // result would leave history the providers reject on the next turn
+            // (an assistant tool call with no matching tool message).
+            const inFlightToolCallIds = new Set<string>();
+            for (const m of messages) {
+              if (!inFlightMessageIds.has(m.id)) continue;
+              for (const tc of (m as AssistantMessage).toolCalls ?? []) {
+                inFlightToolCallIds.add(tc.id);
+              }
+            }
+
+            const isInFlight = (m: Message) =>
+              inFlightMessageIds.has(m.id) ||
+              (m.role === "tool" && inFlightToolCallIds.has((m as ToolMessage).toolCallId));
+
+            // Step 1 + 2: Keep preserved client-only messages and in-flight
+            // messages as-is, keep messages present in the snapshot (replaced
+            // with snapshot version), drop everything else.
+            const keepLocal = (m: Message) =>
+              isPreservedClientOnly(m) || (isInFlight(m) && !snapshotMap.has(m.id));
             messages = messages
-              .filter((m) => isPreservedClientOnly(m) || snapshotMap.has(m.id))
-              .map((m) => (isPreservedClientOnly(m) ? m : snapshotMap.get(m.id)!));
+              .filter((m) => keepLocal(m) || snapshotMap.has(m.id))
+              .map((m) => (keepLocal(m) ? m : snapshotMap.get(m.id)!));
 
             // Step 3: Append messages from the snapshot that we don't have yet.
             const existingIds = new Set(messages.map((m) => m.id));
