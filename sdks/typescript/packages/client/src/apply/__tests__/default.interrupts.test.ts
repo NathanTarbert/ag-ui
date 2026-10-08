@@ -76,6 +76,35 @@ describe("RUN_FINISHED and pendingInterrupts", () => {
     await expect(agent.runAgent({ runId: "run-3" })).resolves.toBeDefined();
   });
 
+  it("keeps a re-raised interrupt pending when a later run in the same stream finishes plainly", async () => {
+    // The client answers int-1, and the stream re-raises the same id before
+    // opening a run of its own and finishing it plainly. The resume the client
+    // sent covers the id it answered, not the one the server raised afterwards,
+    // so the re-raised entry has to survive the plain finish.
+    const agent = new TestAgent({ threadId: "t", initialMessages: [] });
+    agent.setEvents([runStarted("run-1"), interruptFinished("run-1", "int-1")]);
+    await agent.runAgent({ runId: "run-1" });
+    expect(agent.pendingInterrupts.map((i) => i.id)).toEqual(["int-1"]);
+
+    agent.setEvents([
+      runStarted("run-2"),
+      interruptFinished("run-2", "int-1"),
+      runStarted("run-3"),
+      successFinished("run-3"),
+    ]);
+    await agent.runAgent({
+      runId: "run-2",
+      resume: [{ interruptId: "int-1", status: "resolved" }],
+    });
+
+    expect(agent.pendingInterrupts.map((i) => i.id)).toEqual(["int-1"]);
+
+    // The gate stays armed: the next client run still has to answer int-1.
+    await expect(agent.runAgent({ runId: "run-4" })).rejects.toThrow(
+      /pending interrupt\(s\) not addressed by resume: int-1/,
+    );
+  });
+
   it("clears the interrupt when the resume entry cancelled it", async () => {
     const agent = new TestAgent({ threadId: "t", initialMessages: [] });
     agent.setEvents([runStarted("run-1"), interruptFinished("run-1", "int-1")]);

@@ -142,6 +142,13 @@ export const defaultApplyEvents = (
   let messages = structuredClone_(agent.messages);
   let state = structuredClone_(input.state);
   let currentMutation: AgentStateMutation = {};
+  // The interrupt ids this stream was started to answer. Built once, here,
+  // because a plain RUN_FINISHED has to retire what the *run* set out to
+  // answer, not whatever happens to be listed in `resume` by the time the
+  // stream ends. An interrupt the server raises part-way through is dropped
+  // from this set as it is raised, so a later plain finish in the same stream
+  // can't retire it on the strength of a resume that predates it.
+  const answered = new Set((input.resume ?? []).map((entry) => entry.interruptId));
 
   const applyMutation = (mutation: AgentStateMutation) => {
     if (mutation.messages !== undefined) {
@@ -1092,7 +1099,7 @@ export const defaultApplyEvents = (
           // can't mutate the agent's tracked state through array aliasing.
           if (mutation.stopPropagation !== true) {
             if (finishedParams.outcome === "interrupt") {
-              agent.pendingInterrupts = finishedParams.interrupts.map((interrupt) => {
+              const raised = finishedParams.interrupts.map((interrupt) => {
                 if ((interrupt as { subagentRunId?: string | null }).subagentRunId !== null) {
                   return interrupt;
                 }
@@ -1102,17 +1109,22 @@ export const defaultApplyEvents = (
                 delete copy.subagentRunId;
                 return copy as typeof interrupt;
               });
+              // Nothing the client sent can have answered an interrupt that is
+              // being raised right now, even when the server reuses an id the
+              // resume mentions.
+              for (const interrupt of raised) {
+                answered.delete(interrupt.id);
+              }
+              agent.pendingInterrupts = raised;
             } else {
               // A plain finish only retires the interrupts this run was started
-              // to answer, and `input.resume` is the client's own record of
-              // which those are. Clearing the whole list instead would let a
-              // stream that emits an interrupt outcome and then opens a second
-              // run of its own release the gate onInitialize is holding, so the
-              // next client run would go out with the interrupt unanswered.
+              // to answer. Clearing the whole list instead would let a stream
+              // that emits an interrupt outcome and then opens a second run of
+              // its own release the gate onInitialize is holding, so the next
+              // client run would go out with the interrupt unanswered.
               // `?? []` because the reducer also runs against agents whose
               // list was never initialized — a partial stand-in, or a clone
               // that came back without the field.
-              const answered = new Set((input.resume ?? []).map((entry) => entry.interruptId));
               agent.pendingInterrupts = (agent.pendingInterrupts ?? []).filter(
                 (interrupt) => !answered.has(interrupt.id),
               );
