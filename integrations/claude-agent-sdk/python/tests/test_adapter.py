@@ -1484,3 +1484,187 @@ class TestStreamTaskSubagentActivity:
             ]
             assert {e.message_id for e in activity} == {own_id}
             assert foreign_id not in {e.message_id for e in activity}
+
+
+class TestTaskActivityTeardown:
+    """A Task activity is normally closed by the ToolResultBlock carrying the
+    subagent's result. When the run ends before that result arrives — the turn
+    was interrupted, the SDK stream dropped, the run errored — nothing else
+    would ever close it, and the subagent widget spins at ``running`` for good.
+    The run must close it on the way out, in every one of those cases.
+    """
+
+    _task_stream = staticmethod(TestStreamTaskSubagentActivity._task_stream)
+
+    @staticmethod
+    def _activity_deltas(events):
+        return [e for e in events if e.type == EventType.ACTIVITY_DELTA]
+
+    @pytest.mark.asyncio
+    async def test_stream_ending_without_a_result_closes_the_activity(self, make_input):
+        # The dropped / aborted stream: a Task opened, then nothing more.
+        adapter = ClaudeAgentAdapter(name="t")
+        events = await _drive(adapter, self._task_stream(), make_input)
+        types = _types(events)
+        assert types.count(EventType.ACTIVITY_SNAPSHOT) == 1
+        deltas = self._activity_deltas(events)
+        assert len(deltas) == 1
+        assert deltas[0].message_id == "task-s1"
+        assert deltas[0].activity_type == SUBAGENT_TASK_ACTIVITY_TYPE
+        assert deltas[0].patch[0] == {"op": "add", "path": "/status", "value": "failed"}
+        assert deltas[0].patch[1]["path"] == "/error"
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_did_get_its_result_is_not_closed_twice(self, make_input):
+        adapter = ClaudeAgentAdapter(name="t")
+        stream = self._task_stream()[:-1] + [
+            stream_event({"type": "message_stop"}),
+            UserMessage(
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="task-s1",
+                        content=[{"type": "text", "text": '{"found": true}'}],
+                    )
+                ]
+            ),
+        ]
+        events = await _drive(adapter, stream, make_input)
+        deltas = self._activity_deltas(events)
+        assert len(deltas) == 1
+        assert deltas[0].patch[0]["value"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_run_that_errors_mid_stream_closes_the_activity_before_run_error(
+        self, make_input, monkeypatch
+    ):
+        task_stream = self._task_stream()
+
+        class _DyingAfterTaskWorker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def query(self, prompt, session_id="default"):
+                async def _gen():
+                    for m in task_stream:
+                        yield m
+                    raise RuntimeError("stream dropped")
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        adapter = ClaudeAgentAdapter(name="t")
+        monkeypatch.setattr(
+            "ag_ui_claude_sdk.adapter.SessionWorker", _DyingAfterTaskWorker
+        )
+        inp = make_input(messages=[{"id": "1", "role": "user", "content": "hi"}])
+        events = [e async for e in adapter.run(inp)]
+        types = _types(events)
+
+        assert types.count(EventType.ACTIVITY_SNAPSHOT) == 1
+        deltas = self._activity_deltas(events)
+        assert len(deltas) == 1
+        assert deltas[0].message_id == "task-s1"
+        assert deltas[0].patch[0] == {"op": "add", "path": "/status", "value": "failed"}
+        # Nothing may follow RUN_ERROR, so the delta has to land in front of it.
+        assert types[-1] == EventType.RUN_ERROR
+        assert types.index(EventType.ACTIVITY_DELTA) < types.index(EventType.RUN_ERROR)
+
+    @pytest.mark.asyncio
+    async def test_run_whose_turn_reports_an_api_error_closes_the_activity(
+        self, make_input, monkeypatch
+    ):
+        from claude_agent_sdk import ResultMessage
+
+        result_msg = ResultMessage(
+            subtype="error",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result="upstream exploded",
+        )
+        task_stream = self._task_stream() + [result_msg]
+
+        class _ErroredTurnWorker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def query(self, prompt, session_id="default"):
+                async def _gen():
+                    for m in task_stream:
+                        yield m
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        adapter = ClaudeAgentAdapter(name="t")
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _ErroredTurnWorker)
+        inp = make_input(messages=[{"id": "1", "role": "user", "content": "hi"}])
+        events = [e async for e in adapter.run(inp)]
+        types = _types(events)
+
+        deltas = self._activity_deltas(events)
+        assert len(deltas) == 1
+        assert deltas[0].patch[0] == {"op": "add", "path": "/status", "value": "failed"}
+        assert types[-1] == EventType.RUN_ERROR
+        assert types.index(EventType.ACTIVITY_DELTA) < types.index(EventType.RUN_ERROR)
+
+    @pytest.mark.asyncio
+    async def test_run_that_times_out_closes_the_activity_before_run_error(
+        self, make_input, monkeypatch
+    ):
+        import asyncio
+
+        task_stream = self._task_stream()
+
+        class _HangingAfterTaskWorker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+            def query(self, prompt, session_id="default"):
+                async def _gen():
+                    for m in task_stream:
+                        yield m
+                    await asyncio.sleep(3600)
+
+                return _gen()
+
+            async def stop(self):
+                pass
+
+        adapter = ClaudeAgentAdapter(name="t", query_timeout_seconds=0.05)
+        monkeypatch.setattr(
+            "ag_ui_claude_sdk.adapter.SessionWorker", _HangingAfterTaskWorker
+        )
+        inp = make_input(messages=[{"id": "1", "role": "user", "content": "hi"}])
+        events = [e async for e in adapter.run(inp)]
+        types = _types(events)
+
+        deltas = self._activity_deltas(events)
+        assert len(deltas) == 1
+        assert deltas[0].patch[0] == {"op": "add", "path": "/status", "value": "failed"}
+        assert types[-1] == EventType.RUN_ERROR
+        assert types.index(EventType.ACTIVITY_DELTA) < types.index(EventType.RUN_ERROR)

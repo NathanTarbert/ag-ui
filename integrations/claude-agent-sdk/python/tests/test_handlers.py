@@ -12,6 +12,7 @@ from ag_ui.core import EventType
 from ag_ui_claude_sdk.config import STATE_MANAGEMENT_TOOL_FULL_NAME
 from ag_ui_claude_sdk.handlers import (
     SUBAGENT_TASK_ACTIVITY_TYPE,
+    close_open_task_activities,
     handle_tool_use_block,
     handle_tool_result_block,
 )
@@ -618,3 +619,100 @@ class TestTaskSubagentActivity:
 
         assert ag_ui_claude_sdk.SUBAGENT_TASK_ACTIVITY_TYPE == SUBAGENT_TASK_ACTIVITY_TYPE
         assert "SUBAGENT_TASK_ACTIVITY_TYPE" in ag_ui_claude_sdk.__all__
+
+    @pytest.mark.asyncio
+    async def test_failed_task_error_payload_matches_the_success_payload_shape(self, registry):
+        # A renderer reads ``content.result`` when a subagent succeeds and
+        # ``content.error`` when it fails. Both must carry the same kind of
+        # value — the parsed object when the subagent returned JSON — so the
+        # failure path does not hand the frontend a JSON string it has to
+        # parse a second time.
+        ok = ToolUseBlock(id="task-ok", name="Task", input={"prompt": "go"})
+        _, gen = await handle_tool_use_block(ok, _Msg(), "th", "run", None, registry)
+        await collect(gen)
+        ok_delta = (
+            await collect(
+                handle_tool_result_block(
+                    ToolResultBlock(
+                        tool_use_id="task-ok",
+                        content=[{"type": "text", "text": '{"detail": "fine"}'}],
+                    ),
+                    "th",
+                    "run",
+                    registry,
+                )
+            )
+        )[-1]
+
+        bad = ToolUseBlock(id="task-bad", name="Task", input={"prompt": "go"})
+        _, gen = await handle_tool_use_block(bad, _Msg(), "th", "run", None, registry)
+        await collect(gen)
+        bad_delta = (
+            await collect(
+                handle_tool_result_block(
+                    ToolResultBlock(
+                        tool_use_id="task-bad",
+                        content=[{"type": "text", "text": '{"detail": "boom"}'}],
+                        is_error=True,
+                    ),
+                    "th",
+                    "run",
+                    registry,
+                )
+            )
+        )[-1]
+
+        assert ok_delta.patch[1] == {
+            "op": "add",
+            "path": "/result",
+            "value": {"detail": "fine"},
+        }
+        assert bad_delta.patch[1] == {
+            "op": "add",
+            "path": "/error",
+            "value": {"detail": "boom"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_task_with_plain_text_carries_the_text_unwrapped(self, registry):
+        use = ToolUseBlock(id="task-text", name="Task", input={"prompt": "go"})
+        _, gen = await handle_tool_use_block(use, _Msg(), "th", "run", None, registry)
+        await collect(gen)
+        events = await collect(
+            handle_tool_result_block(
+                ToolResultBlock(
+                    tool_use_id="task-text", content="subagent exploded", is_error=True
+                ),
+                "th",
+                "run",
+                registry,
+            )
+        )
+        assert events[-1].patch[1] == {
+            "op": "add",
+            "path": "/error",
+            "value": "subagent exploded",
+        }
+        # The TOOL_CALL_RESULT payload keeps its own envelope — only the
+        # activity delta changed.
+        assert json.loads(events[0].content) == {
+            "error": True,
+            "content": "subagent exploded",
+        }
+
+
+class TestCloseOpenTaskActivities:
+    """The teardown the adapter runs when a run ends with activities still open."""
+
+    def test_every_open_activity_is_closed_and_the_registry_emptied(self):
+        registry = {"a": SUBAGENT_TASK_ACTIVITY_TYPE, "b": SUBAGENT_TASK_ACTIVITY_TYPE}
+        events = close_open_task_activities(registry)
+        assert [e.message_id for e in events] == ["a", "b"]
+        assert all(e.type == EventType.ACTIVITY_DELTA for e in events)
+        assert all(e.activity_type == SUBAGENT_TASK_ACTIVITY_TYPE for e in events)
+        assert events[0].patch[0] == {"op": "add", "path": "/status", "value": "failed"}
+        assert events[0].patch[1]["path"] == "/error"
+        assert registry == {}
+
+    def test_nothing_open_produces_nothing(self):
+        assert close_open_task_activities({}) == []
